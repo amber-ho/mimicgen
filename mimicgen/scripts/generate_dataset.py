@@ -30,12 +30,24 @@ import time
 import argparse
 import traceback
 import random
+import sys
 import imageio
 import numpy as np
 from copy import deepcopy
+from pathlib import Path
+from xml.etree import ElementTree as ET
+
+SIM_ROOT = Path(__file__).resolve().parents[3]
+for package_root in (SIM_ROOT / "mimicgen", SIM_ROOT / "robosuite"):
+    if str(package_root) not in sys.path:
+        sys.path.insert(0, str(package_root))
 
 import robomimic
 from robomimic.utils.file_utils import get_env_metadata_from_dataset
+import h5py
+from robosuite.utils import RandomizationError
+from robosuite.utils import transform_utils as T
+from robosuite.utils.placement_samplers import ObjectPositionSampler, UniformRandomSampler
 
 import mimicgen
 import mimicgen.utils.file_utils as MG_FileUtils
@@ -46,6 +58,247 @@ from mimicgen.datagen.data_generator import DataGenerator
 from mimicgen.env_interfaces.base import make_interface
 
 
+class AnnulusRandomSampler(ObjectPositionSampler):
+    """
+    Area-uniform annulus sampler used by the exp0 Lift source / target datasets.
+    """
+
+    def __init__(
+        self,
+        name,
+        mujoco_objects=None,
+        inner_radius=0.0,
+        outer_radius=0.10,
+        center_xy=(0.0, 0.0),
+        rotation=None,
+        ensure_valid_placement=True,
+        reference_pos=(0, 0, 0),
+        z_offset=0.0,
+    ):
+        self.inner_radius = inner_radius
+        self.outer_radius = outer_radius
+        self.center_xy = np.asarray(center_xy, dtype=float)
+        self.rotation = rotation
+        super().__init__(
+            name=name,
+            mujoco_objects=mujoco_objects,
+            ensure_object_boundary_in_range=False,
+            ensure_valid_placement=ensure_valid_placement,
+            reference_pos=reference_pos,
+            z_offset=z_offset,
+        )
+
+    def _sample_xy(self):
+        lower = self.inner_radius ** 2
+        if self.inner_radius > 0.0:
+            lower = np.nextafter(lower, np.inf)
+        radius = np.sqrt(np.random.uniform(lower, self.outer_radius ** 2))
+        theta = np.random.uniform(0.0, 2.0 * np.pi)
+        xy = self.center_xy + radius * np.array([np.cos(theta), np.sin(theta)])
+        return xy[0], xy[1]
+
+    def _sample_quat(self):
+        if self.rotation is None:
+            rot_angle = np.random.uniform(0.0, 2.0 * np.pi)
+        elif np.iterable(self.rotation):
+            rot_angle = np.random.uniform(min(self.rotation), max(self.rotation))
+        else:
+            rot_angle = self.rotation
+        return np.array([np.cos(rot_angle / 2.0), 0.0, 0.0, np.sin(rot_angle / 2.0)])
+
+    def sample(self, fixtures=None, reference=None, on_top=True):
+        placed_objects = {} if fixtures is None else dict(fixtures)
+        if reference is None:
+            base_offset = np.asarray(self.reference_pos, dtype=float)
+        elif isinstance(reference, str):
+            assert reference in placed_objects
+            ref_pos, _, ref_obj = placed_objects[reference]
+            base_offset = np.asarray(ref_pos, dtype=float)
+            if on_top:
+                base_offset += np.array((0, 0, ref_obj.top_offset[-1]))
+        else:
+            base_offset = np.asarray(reference, dtype=float)
+
+        for obj in self.mujoco_objects:
+            assert obj.name not in placed_objects, "Object '{}' has already been sampled!".format(obj.name)
+            horizontal_radius = obj.horizontal_radius
+            bottom_offset = obj.bottom_offset
+            success = False
+
+            for _ in range(5000):
+                dx, dy = self._sample_xy()
+                object_x = base_offset[0] + dx
+                object_y = base_offset[1] + dy
+                object_z = self.z_offset + base_offset[2]
+                if on_top:
+                    object_z -= bottom_offset[-1]
+
+                location_valid = True
+                if self.ensure_valid_placement:
+                    for (x, y, z), _, other_obj in placed_objects.values():
+                        if (
+                            np.linalg.norm((object_x - x, object_y - y))
+                            <= other_obj.horizontal_radius + horizontal_radius
+                        ) and (object_z - z <= other_obj.top_offset[-1] - bottom_offset[-1]):
+                            location_valid = False
+                            break
+
+                if location_valid:
+                    quat = self._sample_quat()
+                    if hasattr(obj, "init_quat"):
+                        quat = T.quat_multiply(quat, obj.init_quat)
+                    placed_objects[obj.name] = ((object_x, object_y, object_z), quat, obj)
+                    success = True
+                    break
+
+            if not success:
+                raise RandomizationError("Cannot place all objects")
+
+        return placed_objects
+
+
+def infer_lift_table_height_from_dataset(dataset_path):
+    """
+    Infer robosuite Lift table-top z from the first demo's saved model XML.
+    """
+    try:
+        with h5py.File(dataset_path, "r") as f:
+            demo_keys = sorted(f["data"].keys(), key=lambda key: int(key.rsplit("_", 1)[1]))
+            model_xml = f["data/{}".format(demo_keys[0])].attrs.get("model_file", None)
+    except Exception:
+        return None
+
+    if model_xml is None:
+        return None
+
+    try:
+        root = ET.fromstring(model_xml)
+    except ET.ParseError:
+        return None
+
+    for body in root.iter("body"):
+        if body.attrib.get("name") != "table":
+            continue
+        body_pos = [float(v) for v in body.attrib.get("pos", "0 0 0").split()]
+        for site in body.iter("site"):
+            if site.attrib.get("name") == "table_top":
+                site_pos = [float(v) for v in site.attrib.get("pos", "0 0 0").split()]
+                return body_pos[2] + site_pos[2]
+    return None
+
+
+def get_exp0_dataset_meta(dataset_path):
+    """
+    Return exp0-specific metadata stored alongside robomimic env_args.
+    """
+    try:
+        with h5py.File(dataset_path, "r") as f:
+            env_args = f["data"].attrs.get("env_args", None)
+    except Exception:
+        return {}
+    if env_args is None:
+        return {}
+    try:
+        return json.loads(env_args)
+    except json.JSONDecodeError:
+        return {}
+
+
+def patch_lift_table_height(table_height):
+    """
+    Match a source robosuite Lift dataset that was collected with a monkey-patched table height.
+    """
+    if table_height is None:
+        return
+
+    import robosuite.environments.manipulation.lift as lift_env
+
+    original_load_model = lift_env.Lift._load_model
+
+    def load_model_with_table_height(self):
+        self.table_offset = np.array((0.0, 0.0, table_height))
+        return original_load_model(self)
+
+    lift_env.Lift._load_model = load_model_with_table_height
+
+
+def restore_exp0_lift_generation_behavior(env, dataset_meta):
+    """
+    Restore non-JSON robosuite behavior that exp0 records as metadata.
+
+    The original source / target demos use a custom cube placement sampler and,
+    for Piper, a reset-time base-yaw prealignment toward the sampled cube. Those
+    Python objects cannot be serialized in robomimic env_args, so recreate them
+    here before MimicGen starts sampling new task instances.
+    """
+    if not dataset_meta:
+        return
+
+    base_env = env.base_env
+    placement_meta = dataset_meta.get("cube_placement")
+    if placement_meta is not None and hasattr(base_env, "cube"):
+        table_height = float(base_env.model.mujoco_arena.table_offset[2])
+        placement_type = placement_meta.get("type")
+        if placement_type == "area_uniform_annulus":
+            base_env.placement_initializer = AnnulusRandomSampler(
+                name="ObjectSampler",
+                mujoco_objects=base_env.cube,
+                inner_radius=float(placement_meta["inner_radius"]),
+                outer_radius=float(placement_meta["outer_radius"]),
+                center_xy=placement_meta["center_xy"],
+                rotation=placement_meta.get("rotation", 0.0),
+                ensure_valid_placement=True,
+                reference_pos=(0.0, 0.0, table_height),
+                z_offset=0.01,
+            )
+            print("Restored exp0 annulus cube placement: {}".format(placement_meta))
+        elif placement_type == "uniform_box":
+            base_env.placement_initializer = UniformRandomSampler(
+                name="ObjectSampler",
+                mujoco_objects=base_env.cube,
+                x_range=placement_meta["x_range"],
+                y_range=placement_meta["y_range"],
+                rotation=placement_meta.get("rotation", 0.0),
+                ensure_object_boundary_in_range=False,
+                ensure_valid_placement=True,
+                reference_pos=(0.0, 0.0, table_height),
+                z_offset=0.01,
+            )
+            print("Restored exp0 box cube placement: {}".format(placement_meta))
+
+    scripted_reset = dataset_meta.get("scripted_reset", {})
+    if not scripted_reset.get("prealign_base_yaw", False):
+        return
+
+    original_reset = env.reset
+    yaw_limit = float(scripted_reset.get("prealign_yaw_limit", 1.30))
+
+    def reset_with_prealign():
+        original_reset()
+        robot = base_env.robots[0]
+        if not hasattr(robot, "set_robot_joint_positions"):
+            return env.get_observation()
+
+        joint_positions = np.asarray(robot._joint_positions).copy()
+        if joint_positions.size == 0:
+            return env.get_observation()
+
+        cube_pos = np.asarray(base_env.sim.data.body_xpos[base_env.cube_body_id])
+        base_pos = np.asarray(robot.base_pos)
+        yaw = np.arctan2(cube_pos[1] - base_pos[1], cube_pos[0] - base_pos[0])
+        yaw = np.clip(yaw, -yaw_limit, yaw_limit)
+
+        joint_positions[0] = yaw
+        robot.set_robot_joint_positions(joint_positions)
+        if hasattr(robot, "controller") and hasattr(robot.controller, "update_initial_joints"):
+            robot.controller.update_initial_joints(joint_positions)
+        base_env.sim.forward()
+        return env.get_observation()
+
+    env.reset = reset_with_prealign
+    print("Restored exp0 Piper reset prealignment with yaw limit {}".format(yaw_limit))
+
+
 def get_important_stats(
     new_dataset_folder_path,
     num_success,
@@ -54,6 +307,7 @@ def get_important_stats(
     num_problematic,
     start_time=None,
     ep_length_stats=None,
+    dataset_path=None,
 ):
     """
     Return a summary of important stats to write to json.
@@ -81,6 +335,8 @@ def get_important_stats(
         num_attempts=num_attempts,
         num_problematic=num_problematic,
     )
+    if dataset_path is not None:
+        important_stats["dataset_path"] = dataset_path
     if (ep_length_stats is not None):
         important_stats.update(ep_length_stats)
     if start_time is not None:
@@ -97,6 +353,7 @@ def generate_dataset(
     video_skip=5,
     render_image_names=None,
     pause_subtask=False,
+    output_path=None,
 ):
     """
     Main function to collect a new dataset with MimicGen.
@@ -141,6 +398,13 @@ def generate_dataset(
 
     # get environment metadata from dataset
     env_meta = get_env_metadata_from_dataset(dataset_path=source_dataset_path)
+    dataset_meta = get_exp0_dataset_meta(source_dataset_path)
+
+    if env_meta.get("env_name") == "Lift":
+        table_height = infer_lift_table_height_from_dataset(source_dataset_path)
+        if table_height is not None:
+            print("Using Lift table height inferred from source dataset: {}".format(table_height))
+            patch_lift_table_height(table_height)
 
     # set seed for generation
     random.seed(mg_config.experiment.seed)
@@ -170,6 +434,22 @@ def generate_dataset(
             exist_ok = True
     os.makedirs(new_dataset_folder_path, exist_ok=exist_ok)
 
+    if output_path is not None:
+        output_path = os.path.abspath(os.path.expandvars(os.path.expanduser(output_path)))
+        output_parent = os.path.dirname(output_path)
+        if len(output_parent) > 0:
+            os.makedirs(output_parent, exist_ok=True)
+        if os.path.exists(output_path):
+            if not auto_remove_exp:
+                ans = input("\nWARNING: output dataset ({}) already exists! \noverwrite? (y/n)\n".format(output_path))
+            else:
+                ans = "y"
+            if ans == "y":
+                print("Removed old output dataset at {}".format(output_path))
+                os.remove(output_path)
+            else:
+                raise FileExistsError("Refusing to overwrite output dataset {}".format(output_path))
+
     # log terminal output to text file
     RobomimicUtils.make_print_logger(txt_file=os.path.join(new_dataset_folder_path, 'log.txt'))
 
@@ -186,7 +466,9 @@ def generate_dataset(
     # some paths that we will create inside our new dataset folder
 
     # new dataset that will be generated
-    new_dataset_path = os.path.join(new_dataset_folder_path, "demo.hdf5")
+    new_dataset_path = output_path if output_path is not None else os.path.join(new_dataset_folder_path, "demo.hdf5")
+    if output_path is not None:
+        print("Successful trajectories will be written to: {}".format(new_dataset_path))
 
     # tmp folder that will contain per-episode hdf5s that were successful (they will be merged later)
     tmp_dataset_folder_path = os.path.join(new_dataset_folder_path, "tmp")
@@ -245,6 +527,7 @@ def generate_dataset(
     print("\n==== Using environment with the following metadata ====")
     print(json.dumps(env.serialize(), indent=4))
     print("")
+    restore_exp0_lift_generation_behavior(env=env, dataset_meta=dataset_meta)
 
     # get information necessary to create env interface
     env_interface_name, env_interface_type = MG_FileUtils.get_env_interface_info_from_dataset(
@@ -391,6 +674,7 @@ def generate_dataset(
                 num_problematic=num_problematic,
                 start_time=start_time,
                 ep_length_stats=None,
+                dataset_path=new_dataset_path,
             )
 
             # write stats to disk
@@ -447,6 +731,7 @@ def generate_dataset(
         num_problematic=num_problematic,
         start_time=start_time,
         ep_length_stats=ep_length_stats,
+        dataset_path=new_dataset_path,
     )
     print("\nStats Summary")
     print(json.dumps(stats, indent=4))
@@ -490,6 +775,7 @@ def generate_dataset(
         num_problematic=num_problematic,
         start_time=start_time,
         ep_length_stats=ep_length_stats,
+        dataset_path=new_dataset_path,
     )
 
     # write stats to disk
@@ -533,6 +819,15 @@ def main(args):
         if args.source is not None:
             mg_config.experiment.source.dataset_path = args.source
 
+        if args.source_filter_key is not None:
+            mg_config.experiment.source.filter_key = args.source_filter_key
+
+        if args.source_n is not None:
+            mg_config.experiment.source.n = args.source_n
+
+        if args.source_start is not None:
+            mg_config.experiment.source.start = args.source_start
+
         if args.folder is not None:
             mg_config.experiment.generation.path = args.folder
 
@@ -564,6 +859,7 @@ def main(args):
             video_skip=args.video_skip,
             render_image_names=args.render_image_names,
             pause_subtask=args.pause_subtask,
+            output_path=args.output,
         )
     except Exception as e:
         res_str = "run failed with error:\n{}\n\n{}".format(e, traceback.format_exc())
@@ -628,6 +924,24 @@ if __name__ == "__main__":
         help="path to source dataset, to override the one in the config",
     )
     parser.add_argument(
+        "--source_filter_key",
+        type=str,
+        help="optional source dataset mask key, for example 'successful'",
+        default=None,
+    )
+    parser.add_argument(
+        "--source_n",
+        type=int,
+        help="if provided, use only the first N source trajectories after filtering / start offset",
+        default=None,
+    )
+    parser.add_argument(
+        "--source_start",
+        type=int,
+        help="if provided, skip the first N source trajectories after filtering",
+        default=None,
+    )
+    parser.add_argument(
         "--task_name",
         type=str,
         help="environment name to use for data generation, to override the one in the config",
@@ -637,6 +951,12 @@ if __name__ == "__main__":
         "--folder",
         type=str,
         help="folder that will be created with new data, to override the one in the config",
+        default=None,
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        help="optional exact path for the generated successful demo hdf5; logs still go under --folder / experiment name",
         default=None,
     )
     parser.add_argument(

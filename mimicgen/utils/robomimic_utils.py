@@ -15,6 +15,7 @@ import robomimic
 from robomimic.utils.log_utils import PrintLogger
 import robomimic.utils.env_utils as EnvUtils
 from robomimic.scripts.playback_dataset import playback_dataset, DEFAULT_CAMERAS
+from robosuite.robots import ROBOT_CLASS_MAPPING
 
 from mimicgen.utils.misc_utils import deep_update
 
@@ -79,7 +80,7 @@ def create_env(
     if robot is not None:
         # for now, only support this argument for robosuite environments
         assert EnvUtils.is_robosuite_env(env_meta)
-        assert robot in ["IIWA", "Sawyer", "UR5e", "Panda", "Jaco", "Kinova3"]
+        assert robot in ROBOT_CLASS_MAPPING, "Unknown robosuite robot: {}".format(robot)
         env_meta["env_kwargs"]["robots"] = [robot]
     if gripper is not None:
         # for now, only support this argument for robosuite environments

@@ -20,9 +20,16 @@ import shutil
 import json
 import h5py
 import argparse
+import sys
 import numpy as np
 from copy import deepcopy
+from pathlib import Path
 from tqdm import tqdm
+
+SIM_ROOT = Path(__file__).resolve().parents[3]
+for package_root in (SIM_ROOT / "mimicgen", SIM_ROOT / "robosuite"):
+    if str(package_root) not in sys.path:
+        sys.path.insert(0, str(package_root))
 
 import robomimic
 import robomimic.utils.tensor_utils as TensorUtils
@@ -102,6 +109,7 @@ def prepare_src_dataset(
     filter_key=None,
     n=None,
     output_path=None,
+    success_filter_key=None,
 ):
     """
     Adds DatagenInfo object instance for each timestep in each source demonstration trajectory 
@@ -123,6 +131,9 @@ def prepare_src_dataset(
 
         output_path (str or None): if provided, write a new hdf5 here instead of modifying the
             original dataset in-place
+
+        success_filter_key (str or None): if provided, create /mask/<success_filter_key>
+            containing demos whose final reward is positive
     """
 
     # maybe write to new file instead of modifying existing file in-place
@@ -209,6 +220,18 @@ def prepare_src_dataset(
         ep_grp["datagen_info"].attrs["env_interface_type"] = env_interface_type
 
     print("Modified {} trajectories to include datagen info.".format(len(demos)))
+    if success_filter_key is not None:
+        successful_demos = []
+        for ep in demos:
+            rewards = f["data/{}/rewards".format(ep)][()]
+            if len(rewards) > 0 and rewards[-1] > 0:
+                successful_demos.append(ep)
+
+        mask_grp = f.require_group("mask")
+        if success_filter_key in mask_grp:
+            del mask_grp[success_filter_key]
+        mask_grp.create_dataset(success_filter_key, data=np.array(successful_demos, dtype="S"))
+        print("Wrote mask/{} with {} successful trajectories.".format(success_filter_key, len(successful_demos)))
     f.close()
 
 
@@ -250,6 +273,12 @@ if __name__ == "__main__":
         default=None,
         help="(optional) path to output hdf5 dataset, instead of modifying existing dataset in-place",
     )
+    parser.add_argument(
+        "--success_filter_key",
+        type=str,
+        default=None,
+        help="(optional) write a mask with demos whose final reward is positive, e.g. successful",
+    )
 
     args = parser.parse_args()
     prepare_src_dataset(
@@ -259,4 +288,5 @@ if __name__ == "__main__":
         filter_key=args.filter_key,
         n=args.n,
         output_path=args.output,
+        success_filter_key=args.success_filter_key,
     )
