@@ -347,7 +347,6 @@ def get_important_stats(
 
 def generate_dataset(
     mg_config,
-    auto_remove_exp=False,
     render=False,
     video_path=None,
     video_skip=5,
@@ -360,9 +359,6 @@ def generate_dataset(
 
     Args:
         mg_config (MG_Config instance): MimicGen config object
-
-        auto_remove_exp (bool): if True, will remove generation folder if it exists, else
-            user will be prompted to decide whether to keep existing folder or not
 
         render (bool): if True, render each data generation attempt on-screen
 
@@ -420,19 +416,9 @@ def generate_dataset(
     print("\nData will be generated at: {}".format(new_dataset_folder_path))
 
     # ensure dataset folder does not exist, and make new folder
-    exist_ok = False
     if os.path.exists(new_dataset_folder_path):
-        if not auto_remove_exp:
-            ans = input("\nWARNING: dataset folder ({}) already exists! \noverwrite? (y/n)\n".format(new_dataset_folder_path))
-        else:
-            ans = "y"
-        if ans == "y":
-            print("Removed old results folder at {}".format(new_dataset_folder_path))
-            shutil.rmtree(new_dataset_folder_path)
-        else:
-            print("Keeping old dataset folder. Note that individual files may still be overwritten.")
-            exist_ok = True
-    os.makedirs(new_dataset_folder_path, exist_ok=exist_ok)
+        raise FileExistsError("Refusing to overwrite dataset folder {}".format(new_dataset_folder_path))
+    os.makedirs(new_dataset_folder_path)
 
     if output_path is not None:
         output_path = os.path.abspath(os.path.expandvars(os.path.expanduser(output_path)))
@@ -440,15 +426,7 @@ def generate_dataset(
         if len(output_parent) > 0:
             os.makedirs(output_parent, exist_ok=True)
         if os.path.exists(output_path):
-            if not auto_remove_exp:
-                ans = input("\nWARNING: output dataset ({}) already exists! \noverwrite? (y/n)\n".format(output_path))
-            else:
-                ans = "y"
-            if ans == "y":
-                print("Removed old output dataset at {}".format(output_path))
-                os.remove(output_path)
-            else:
-                raise FileExistsError("Refusing to overwrite output dataset {}".format(output_path))
+            raise FileExistsError("Refusing to overwrite output dataset {}".format(output_path))
 
     # log terminal output to text file
     RobomimicUtils.make_print_logger(txt_file=os.path.join(new_dataset_folder_path, 'log.txt'))
@@ -834,9 +812,6 @@ def main(args):
         if args.num_demos is not None:
             mg_config.experiment.generation.num_trials = args.num_demos
 
-        if args.seed is not None:
-            mg_config.experiment.seed = args.seed
-
         # maybe modify config for debugging purposes
         if args.debug:
             # shrink length of generation to test whether this run is likely to crash
@@ -853,7 +828,6 @@ def main(args):
     try:
         important_stats = generate_dataset(
             mg_config=mg_config,
-            auto_remove_exp=args.auto_remove_exp,
             render=args.render,
             video_path=args.video_path,
             video_skip=args.video_skip,
@@ -882,11 +856,6 @@ if __name__ == "__main__":
         "--debug",
         action='store_true',
         help="set this flag to run a quick generation run for debugging purposes",
-    )
-    parser.add_argument(
-        "--auto-remove-exp",
-        action='store_true',
-        help="force delete the experiment folder if it exists"
     )
     parser.add_argument(
         "--render",
@@ -965,12 +934,5 @@ if __name__ == "__main__":
         help="number of demos to generate, or attempt to generate, to override the one in the config",
         default=None,
     )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        help="seed, to override the one in the config",
-        default=None,
-    )
-
     args = parser.parse_args()
     main(args)
