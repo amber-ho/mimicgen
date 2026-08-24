@@ -9,8 +9,11 @@ import sys
 import json
 import traceback
 import argparse
+import subprocess
 from copy import deepcopy
+from pathlib import Path
 
+import h5py
 import robomimic
 from robomimic.utils.log_utils import PrintLogger
 import robomimic.utils.env_utils as EnvUtils
@@ -129,6 +132,35 @@ def make_dataset_video(
         video_path,
         "\n\tnum_render={},".format(num_render) if num_render is not None else "",
     ))
+
+    # The generic robomimic wrapper recreates Piper's robosuite environment
+    # differently from the state renderer used for replay datasets, which can
+    # change the effective camera view even when model_file contains the right
+    # calibrated frontview pose. Use the same renderer as replay_video_* so
+    # generated and replay videos have identical camera semantics.
+    with h5py.File(dataset_path, "r") as dataset_file:
+        env_args = json.loads(dataset_file["data"].attrs["env_args"])
+    robots = env_args.get("env_kwargs", {}).get("robots", [])
+    if isinstance(robots, str):
+        robots = [robots]
+    if any(str(robot).lower() == "piper" for robot in robots):
+        sim_root = Path(__file__).resolve().parents[3]
+        command = [
+            sys.executable,
+            str(sim_root / "scripts" / "vis_hdf5.py"),
+            "--hdf5", str(dataset_path),
+            "--video", str(video_path),
+            "--camera", "frontview",
+            "--width", "640",
+            "--height", "480",
+            "--fps", "20",
+            "--skip-frame", str(video_skip),
+        ]
+        if num_render is not None:
+            command.extend(["--n", str(num_render)])
+        subprocess.run(command, check=True)
+        return
+
     playback_args = argparse.Namespace()
     playback_args.dataset = dataset_path
     playback_args.filter_key = None

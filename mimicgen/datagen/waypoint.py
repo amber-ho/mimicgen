@@ -318,6 +318,8 @@ class WaypointTrajectory(object):
         video_writer=None, 
         video_skip=5, 
         camera_names=None,
+        video_height=480,
+        video_width=640,
     ):
         """
         Main function to execute the trajectory. Will use env_interface.target_pose_to_action to
@@ -365,7 +367,12 @@ class WaypointTrajectory(object):
                     if video_count % video_skip == 0:
                         video_img = []
                         for cam_name in camera_names:
-                            video_img.append(env.render(mode="rgb_array", height=512, width=512, camera_name=cam_name))
+                            video_img.append(env.render(
+                                mode="rgb_array",
+                                height=video_height,
+                                width=video_width,
+                                camera_name=cam_name,
+                            ))
                         video_img = np.concatenate(video_img, axis=1) # concatenate horizontally
                         video_writer.append_data(video_img)
                     video_count += 1

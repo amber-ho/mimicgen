@@ -187,10 +187,29 @@ class MG_Lift(RobosuiteInterface):
             object_poses (dict): dictionary that maps object name (str) to object pose matrix (4x4 np.array)
         """
 
-        # one relevant object - the cube being lifted
-        return dict(
+        poses = dict(
             cube=self.get_object_pose(obj_name=self.env.cube.root_body, obj_type="body"),
         )
+        # LiftPlaceCuboid's second subtask is defined relative to the destination
+        # line, not the cube's initial pose. The marker is visual-only, so expose
+        # an explicit target frame at the center of the line.
+        if hasattr(self.env, "target_xy"):
+            target_marker = next(
+                (obj for obj in getattr(self.env, "visual_markers", []) if obj.name == "target_line"),
+                None,
+            )
+            if target_marker is not None:
+                poses["target_line"] = self.get_object_pose(
+                    obj_name=target_marker.root_body,
+                    obj_type="body",
+                )
+            else:
+                table_height = float(self.env.model.mujoco_arena.table_offset[2])
+                poses["target_line"] = PoseUtils.make_pose(
+                    np.array([self.env.target_xy[0], self.env.target_xy[1], table_height]),
+                    np.eye(3),
+                )
+        return poses
 
     def get_subtask_term_signals(self):
         """
@@ -204,11 +223,26 @@ class MG_Lift(RobosuiteInterface):
         """
         signals = dict()
 
-        # first subtask is grasping the cube; final subtask is lifting it.
+        # Keep the original grasp signal for ordinary Lift datasets.
         signals["grasp"] = int(self.env._check_grasp(
             gripper=self.env.robots[0].gripper,
             object_geoms=self.env.cube,
         ))
+
+        # For LiftPlaceCuboid, split after the cube has actually cleared the
+        # table. This is robust for state-playback source datasets where the
+        # contact-based grasp signal can remain zero for the whole trajectory.
+        cube_pos = np.asarray(self.env.sim.data.body_xpos[self.env.cube_body_id])
+        target_pose = self.get_object_poses().get("target_line")
+        table_height = (
+            float(target_pose[2, 3])
+            if target_pose is not None
+            else float(self.env.model.mujoco_arena.table_offset[2])
+        )
+        lift_height = float(getattr(self.env, "LIFT_HEIGHT", 0.04))
+        signals["lift"] = int(
+            cube_pos[2] > table_height + float(self.env.cube.size[2]) + lift_height
+        )
 
         return signals
 

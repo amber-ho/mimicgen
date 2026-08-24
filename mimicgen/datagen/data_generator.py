@@ -190,6 +190,8 @@ class DataGenerator(object):
         video_writer=None,
         video_skip=5,
         camera_names=None,
+        video_height=480,
+        video_width=640,
         pause_subtask=False,
     ):
         """
@@ -344,7 +346,7 @@ class DataGenerator(object):
 
             # Construct trajectory for the transformed segment.
             transformed_seq = WaypointSequence.from_poses(
-                poses=transformed_eef_poses, 
+                poses=transformed_eef_poses,
                 gripper_actions=src_subtask_gripper_actions,
                 action_noise=self.task_spec[subtask_ind]["action_noise"],
             )
@@ -373,6 +375,8 @@ class DataGenerator(object):
                 video_writer=video_writer,
                 video_skip=video_skip,
                 camera_names=camera_names,
+                video_height=video_height,
+                video_width=video_width,
             )
 
             # check that trajectory is non-empty

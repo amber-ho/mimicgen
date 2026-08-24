@@ -27,9 +27,16 @@ from pathlib import Path
 from tqdm import tqdm
 
 SIM_ROOT = Path(__file__).resolve().parents[3]
-for package_root in (SIM_ROOT / "mimicgen", SIM_ROOT / "robosuite"):
-    if str(package_root) not in sys.path:
-        sys.path.insert(0, str(package_root))
+LOCAL_PACKAGE_ROOTS = (
+    SIM_ROOT / "mimicgen" / "robomimic",
+    SIM_ROOT / "mimicgen",
+    SIM_ROOT / "robosuite",
+)
+for package_root in reversed(LOCAL_PACKAGE_ROOTS):
+    package_root = str(package_root)
+    if package_root in sys.path:
+        sys.path.remove(package_root)
+    sys.path.insert(0, package_root)
 
 import robomimic
 import robomimic.utils.tensor_utils as TensorUtils
@@ -48,6 +55,7 @@ def extract_datagen_info_from_trajectory(
     initial_state,
     states,
     actions,
+    target_pose_from_next_eef=False,
 ):
     """
     Helper function to extract observations, rewards, and dones along a trajectory using
@@ -99,6 +107,16 @@ def extract_datagen_info_from_trajectory(
             # list to numpy array
             all_datagen_infos[k] = np.array(all_datagen_infos[k])
 
+    if target_pose_from_next_eef:
+        # Joint-position actions cannot be interpreted as Cartesian delta-pose
+        # actions. Use the achieved EEF pose at the following recorded state as
+        # the Cartesian waypoint instead. The final post-action state is not
+        # stored in robomimic datasets, so hold the last available pose.
+        eef_poses = all_datagen_infos["eef_pose"]
+        all_datagen_infos["target_pose"] = np.concatenate(
+            [eef_poses[1:], eef_poses[-1:]], axis=0
+        )
+
     return all_datagen_infos
 
 
@@ -143,6 +161,13 @@ def prepare_src_dataset(
 
     # create environment that was to collect source demonstrations
     env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=dataset_path)
+    policy_action_space = env_meta.get("policy_action_space")
+    target_pose_from_next_eef = str(policy_action_space).startswith("piper_joint_position")
+    if target_pose_from_next_eef:
+        print(
+            "Detected Piper joint-position source actions; deriving Cartesian "
+            "target poses from the next achieved EEF states."
+        )
     env = EnvUtils.create_env_for_data_processing(
         env_meta=env_meta,
         camera_names=[], 
@@ -201,6 +226,7 @@ def prepare_src_dataset(
             initial_state=initial_state,
             states=states,
             actions=actions,
+            target_pose_from_next_eef=target_pose_from_next_eef,
         )
 
         # delete old dategen info if it already exists

@@ -38,9 +38,16 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 SIM_ROOT = Path(__file__).resolve().parents[3]
-for package_root in (SIM_ROOT / "mimicgen", SIM_ROOT / "robosuite"):
-    if str(package_root) not in sys.path:
-        sys.path.insert(0, str(package_root))
+LOCAL_PACKAGE_ROOTS = (
+    SIM_ROOT / "mimicgen" / "robomimic",
+    SIM_ROOT / "mimicgen",
+    SIM_ROOT / "robosuite",
+)
+for package_root in reversed(LOCAL_PACKAGE_ROOTS):
+    package_root = str(package_root)
+    if package_root in sys.path:
+        sys.path.remove(package_root)
+    sys.path.insert(0, package_root)
 
 import robomimic
 from robomimic.utils.file_utils import get_env_metadata_from_dataset
@@ -351,8 +358,14 @@ def generate_dataset(
     video_path=None,
     video_skip=5,
     render_image_names=None,
+    video_height=480,
+    video_width=640,
     pause_subtask=False,
     output_path=None,
+    camera_pose_file=None,
+    cube_center_xy=None,
+    cube_inner_radius=None,
+    cube_outer_radius=None,
 ):
     """
     Main function to collect a new dataset with MimicGen.
@@ -396,7 +409,68 @@ def generate_dataset(
     env_meta = get_env_metadata_from_dataset(dataset_path=source_dataset_path)
     dataset_meta = get_exp0_dataset_meta(source_dataset_path)
 
-    if env_meta.get("env_name") == "Lift":
+    if cube_outer_radius is not None:
+        if cube_outer_radius < 0.0:
+            raise ValueError("cube outer radius must be non-negative")
+        inner_radius = 0.0 if cube_inner_radius is None else cube_inner_radius
+        if inner_radius < 0.0 or inner_radius > cube_outer_radius:
+            raise ValueError("cube inner radius must be between zero and the outer radius")
+        if cube_center_xy is None:
+            placement = dataset_meta.get("cube_placement") or {}
+            if "center_xy" in placement:
+                cube_center_xy = placement["center_xy"]
+            elif "x_range" in placement and "y_range" in placement:
+                cube_center_xy = [
+                    0.5 * sum(placement["x_range"]),
+                    0.5 * sum(placement["y_range"]),
+                ]
+            else:
+                cube_center_xy = [-0.10, -0.03]
+        dataset_meta["cube_placement"] = {
+            "type": "area_uniform_annulus",
+            "inner_radius": float(inner_radius),
+            "outer_radius": float(cube_outer_radius),
+            "center_xy": [float(v) for v in cube_center_xy],
+            "rotation": 0.0,
+        }
+        print("Overriding generated cube placement: {}".format(dataset_meta["cube_placement"]))
+
+    # MimicGen executes Cartesian EEF waypoints. Source demonstrations may have
+    # been recorded with Piper joint-position actions, but replaying Cartesian
+    # actions through that controller makes the arm interpret XYZ / axis-angle
+    # values as six joint targets. Generate with OSC_POSE instead.
+    piper_joint_source = str(dataset_meta.get("policy_action_space")).startswith("piper_joint_position")
+    if piper_joint_source:
+        from robosuite.controllers import load_controller_config
+
+        controller_config = load_controller_config(default_controller="OSC_POSE")
+        controller_config["control_delta"] = True
+        with mg_config.values_unlocked():
+            mg_config.experiment.task.env_meta_update_kwargs = {
+                "env_kwargs": {"controller_configs": controller_config}
+            }
+        print("Using OSC_POSE for MimicGen Cartesian waypoint execution.")
+
+    if camera_pose_file is not None:
+        camera_pose_file = os.path.abspath(os.path.expanduser(camera_pose_file))
+        if not os.path.isfile(camera_pose_file):
+            raise FileNotFoundError("camera pose file not found: {}".format(camera_pose_file))
+        scripts_root = str(SIM_ROOT / "scripts")
+        if scripts_root not in sys.path:
+            sys.path.insert(0, scripts_root)
+        import script_lift
+
+        camera_pose = script_lift.load_camera_pose_matrix(camera_pose_file)
+        script_lift.patch_lift_camera(
+            script_lift.DEFAULT_CAMERA_NAME,
+            script_lift.DEFAULT_FRONTVIEW_CAMERA_POS,
+            script_lift.DEFAULT_FRONTVIEW_CAMERA_QUAT,
+            script_lift.DEFAULT_FRONTVIEW_CAMERA_FOVY,
+            camera_pose_in_base=camera_pose,
+        )
+        print("Using frontview camera pose from: {}".format(camera_pose_file))
+
+    if env_meta.get("env_name") in {"Lift", "LiftPlaceCuboid"}:
         table_height = infer_lift_table_height_from_dataset(source_dataset_path)
         if table_height is not None:
             print("Using Lift table height inferred from source dataset: {}".format(table_height))
@@ -450,17 +524,17 @@ def generate_dataset(
 
     # tmp folder that will contain per-episode hdf5s that were successful (they will be merged later)
     tmp_dataset_folder_path = os.path.join(new_dataset_folder_path, "tmp")
-    os.makedirs(tmp_dataset_folder_path, exist_ok=exist_ok)
+    os.makedirs(tmp_dataset_folder_path, exist_ok=True)
 
     # folder containing logs
     json_log_path = os.path.join(new_dataset_folder_path, "logs")
-    os.makedirs(json_log_path, exist_ok=exist_ok)
+    os.makedirs(json_log_path, exist_ok=True)
 
     if mg_config.experiment.generation.keep_failed:
         # new dataset for failed trajectories, and tmp folder for per-episode hdf5s that failed
         new_failed_dataset_path = os.path.join(new_dataset_folder_path, "demo_failed.hdf5")
         tmp_dataset_failed_folder_path = os.path.join(new_dataset_folder_path, "tmp_failed")
-        os.makedirs(tmp_dataset_failed_folder_path, exist_ok=exist_ok)
+        os.makedirs(tmp_dataset_failed_folder_path, exist_ok=True)
 
     # get list of source demonstration keys from source hdf5
     all_demos = MG_FileUtils.get_all_demos_from_dataset(
@@ -577,6 +651,8 @@ def generate_dataset(
                 video_writer=video_writer,
                 video_skip=video_skip,
                 camera_names=render_image_names,
+                video_height=video_height,
+                video_width=video_width,
                 pause_subtask=pause_subtask,
             )
         except exceptions_to_except as e:
@@ -811,6 +887,9 @@ def main(args):
 
         if args.num_demos is not None:
             mg_config.experiment.generation.num_trials = args.num_demos
+            # The CLI name says "num_demos", so treat it as the requested
+            # number of successful trajectories rather than total attempts.
+            mg_config.experiment.generation.guarantee = True
 
         # maybe modify config for debugging purposes
         if args.debug:
@@ -832,8 +911,14 @@ def main(args):
             video_path=args.video_path,
             video_skip=args.video_skip,
             render_image_names=args.render_image_names,
+            video_height=args.video_height,
+            video_width=args.video_width,
             pause_subtask=args.pause_subtask,
             output_path=args.output,
+            camera_pose_file=args.camera_pose_file,
+            cube_center_xy=args.cube_center_xy,
+            cube_inner_radius=args.cube_inner_radius,
+            cube_outer_radius=args.cube_outer_radius,
         )
     except Exception as e:
         res_str = "run failed with error:\n{}\n\n{}".format(e, traceback.format_exc())
@@ -873,6 +958,27 @@ if __name__ == "__main__":
         type=int,
         default=5,
         help="skip every nth frame when writing video",
+    )
+    parser.add_argument("--video_height", type=int, default=480)
+    parser.add_argument("--video_width", type=int, default=640)
+    parser.add_argument(
+        "--cube_center_xy",
+        type=float,
+        nargs=2,
+        default=None,
+        help="center XY for generated cuboid positions; defaults to the source center",
+    )
+    parser.add_argument(
+        "--cube_inner_radius",
+        type=float,
+        default=None,
+        help="inner radius of generated cuboid positions (default: 0)",
+    )
+    parser.add_argument(
+        "--cube_outer_radius",
+        type=float,
+        default=None,
+        help="enable random generated cuboid positions within this outer radius",
     )
     parser.add_argument(
         "--render_image_names",
@@ -929,9 +1035,15 @@ if __name__ == "__main__":
         default=None,
     )
     parser.add_argument(
+        "--camera-pose-file",
+        type=str,
+        default=None,
+        help="camera pose in the robot base frame, for example ../data/cam_in_base.txt",
+    )
+    parser.add_argument(
         "--num_demos",
         type=int,
-        help="number of demos to generate, or attempt to generate, to override the one in the config",
+        help="number of successful demos to generate; generation keeps retrying after failed attempts",
         default=None,
     )
     args = parser.parse_args()
