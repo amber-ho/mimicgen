@@ -241,7 +241,12 @@ class DataGenerator(object):
         """
 
         # sample new task instance
-        env.reset()
+        try:
+            env.reset()
+        except Exception as exc:
+            print("[MimicGenDebug] cube_target=None placement_success=False "
+                  "rejection_reason=reset_or_placement_exception exception={!r}".format(exc))
+            raise
         new_initial_state = env.get_state()
 
         # sample new subtask boundaries
@@ -259,6 +264,15 @@ class DataGenerator(object):
         generated_success = False
         generated_src_demo_inds = [] # store selected src demo ind for each subtask in each trajectory
         generated_src_demo_labels = [] # like @generated_src_demo_inds, but padded to align with size of @generated_actions
+        generated_reachability = []
+
+        initial_info = env_interface.get_datagen_info()
+        cube_pose = initial_info.object_poses.get("cube")
+        cube_target = None if cube_pose is None else np.asarray(cube_pose[:3, 3], dtype=float)
+        print("[MimicGenDebug] cube_target={} placement_success={}".format(
+            None if cube_target is None else np.round(cube_target, 6).tolist(),
+            cube_target is not None and np.all(np.isfinite(cube_target)),
+        ))
 
         for subtask_ind in range(len(self.task_spec)):
 
@@ -388,6 +402,11 @@ class DataGenerator(object):
                 generated_success = generated_success or exec_results["success"]
                 generated_src_demo_inds.append(selected_src_demo_ind)
                 generated_src_demo_labels.append(selected_src_demo_ind * np.ones((exec_results["actions"].shape[0], 1), dtype=int))
+                step_offset = len(generated_reachability)
+                for diagnostic in exec_results["reachability"]:
+                    diagnostic["subtask"] = subtask_ind
+                    diagnostic["step"] += step_offset
+                    generated_reachability.append(diagnostic)
 
             # remember last trajectory
             prev_executed_traj = traj_to_execute
@@ -409,5 +428,7 @@ class DataGenerator(object):
             success=generated_success,
             src_demo_inds=generated_src_demo_inds,
             src_demo_labels=generated_src_demo_labels,
+            cube_target=cube_target,
+            reachability=generated_reachability,
         )
         return results

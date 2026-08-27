@@ -351,6 +351,15 @@ class WaypointTrajectory(object):
         observations = []
         datagen_infos = []
         success = { k: False for k in env.is_success() } # success metrics
+        reachability = []
+        trajectory_step = 0
+
+        base_env = env.base_env
+        robot = base_env.robots[0]
+        joint_qpos_ids = np.asarray(robot._ref_joint_pos_indexes, dtype=int)
+        joint_ids = np.asarray(robot._ref_joint_indexes, dtype=int)
+        joint_ranges = np.asarray(base_env.sim.model.jnt_range[joint_ids], dtype=float)
+        robot_contact_geoms = set(getattr(robot.robot_model, "contact_geoms", []))
 
         # iterate over waypoint sequences
         for seq in self.waypoint_sequences:
@@ -401,6 +410,41 @@ class WaypointTrajectory(object):
                 # step environment
                 env.step(play_action)
 
+                # Piper generation uses OSC_POSE, not an inverse-kinematics
+                # controller. Record achieved Cartesian tracking, joint-limit
+                # margin, and contacts without changing rollout behavior.
+                achieved_pose = env_interface.get_robot_eef_pose()
+                position_error = float(np.linalg.norm(waypoint.pose[:3, 3] - achieved_pose[:3, 3]))
+                rotation_delta = waypoint.pose[:3, :3].T.dot(achieved_pose[:3, :3])
+                orientation_error = float(np.arccos(np.clip((np.trace(rotation_delta) - 1.0) / 2.0, -1.0, 1.0)))
+                qpos = np.asarray(base_env.sim.data.qpos[joint_qpos_ids], dtype=float).copy()
+                joint_margin = np.minimum(qpos - joint_ranges[:, 0], joint_ranges[:, 1] - qpos)
+                near_limit = np.flatnonzero(joint_margin <= 0.1).tolist()
+                robot_contacts = []
+                for contact in base_env.sim.data.contact[: base_env.sim.data.ncon]:
+                    geom1 = base_env.sim.model.geom_id2name(contact.geom1)
+                    geom2 = base_env.sim.model.geom_id2name(contact.geom2)
+                    if geom1 in robot_contact_geoms or geom2 in robot_contact_geoms:
+                        robot_contacts.append((geom1, geom2))
+                reachability.append(dict(
+                    step=trajectory_step,
+                    target_pose=waypoint.pose.copy(),
+                    achieved_pose=achieved_pose.copy(),
+                    target_pos=waypoint.pose[:3, 3].copy(),
+                    achieved_pos=achieved_pose[:3, 3].copy(),
+                    position_error=position_error,
+                    orientation_error=orientation_error,
+                    joint_qpos=qpos,
+                    joint_ranges=joint_ranges.copy(),
+                    joint_margin=joint_margin,
+                    near_limit_joints=near_limit,
+                    robot_contacts=robot_contacts,
+                    action_pose=action_pose.copy(),
+                    action_saturated=bool(np.any(np.isclose(np.abs(action_pose), 1.0))),
+                    action_saturated_axes=np.flatnonzero(np.isclose(np.abs(action_pose), 1.0)).tolist(),
+                ))
+                trajectory_step += 1
+
                 # collect data
                 states.append(state)
                 play_action_record = play_action
@@ -418,5 +462,6 @@ class WaypointTrajectory(object):
             datagen_infos=datagen_infos,
             actions=np.array(actions),
             success=bool(success["task"]),
+            reachability=reachability,
         )
         return results

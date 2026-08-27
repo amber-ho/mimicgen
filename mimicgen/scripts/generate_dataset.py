@@ -30,6 +30,7 @@ import time
 import argparse
 import traceback
 import random
+import re
 import sys
 import imageio
 import numpy as np
@@ -356,16 +357,12 @@ def generate_dataset(
     mg_config,
     render=False,
     video_path=None,
-    video_skip=5,
-    render_image_names=None,
-    video_height=480,
-    video_width=640,
     pause_subtask=False,
-    output_path=None,
     camera_pose_file=None,
     cube_center_xy=None,
-    cube_inner_radius=None,
     cube_outer_radius=None,
+    write_diagnostics=True,
+    resume=False,
 ):
     """
     Main function to collect a new dataset with MimicGen.
@@ -378,14 +375,13 @@ def generate_dataset(
         video_path (str or None): if provided, render the data generation attempts to the 
             provided video path
 
-        video_skip (int): skip every nth frame when writing video
-
-        render_image_names (list of str or None): if provided, specify camera names to 
-            use during on-screen / off-screen rendering to override defaults
-
         pause_subtask (bool): if True, pause after every subtask during generation, for
             debugging.
     """
+
+    video_skip = 5
+    video_height, video_width = 480, 640
+    render_image_names = None
 
     # time this run
     start_time = time.time()
@@ -409,27 +405,16 @@ def generate_dataset(
     env_meta = get_env_metadata_from_dataset(dataset_path=source_dataset_path)
     dataset_meta = get_exp0_dataset_meta(source_dataset_path)
 
-    if cube_outer_radius is not None:
-        if cube_outer_radius < 0.0:
-            raise ValueError("cube outer radius must be non-negative")
-        inner_radius = 0.0 if cube_inner_radius is None else cube_inner_radius
-        if inner_radius < 0.0 or inner_radius > cube_outer_radius:
-            raise ValueError("cube inner radius must be between zero and the outer radius")
-        if cube_center_xy is None:
-            placement = dataset_meta.get("cube_placement") or {}
-            if "center_xy" in placement:
-                cube_center_xy = placement["center_xy"]
-            elif "x_range" in placement and "y_range" in placement:
-                cube_center_xy = [
-                    0.5 * sum(placement["x_range"]),
-                    0.5 * sum(placement["y_range"]),
-                ]
-            else:
-                cube_center_xy = [-0.10, -0.03]
+    if cube_outer_radius is not None and cube_outer_radius < 0.0:
+        raise ValueError("cube outer radius must be non-negative")
+    if cube_outer_radius is not None and cube_center_xy is None:
+        raise ValueError("--cube_outer_radius requires --cube_center_xy")
+
+    if cube_center_xy is not None:
         dataset_meta["cube_placement"] = {
             "type": "area_uniform_annulus",
-            "inner_radius": float(inner_radius),
-            "outer_radius": float(cube_outer_radius),
+            "inner_radius": 0.0,
+            "outer_radius": 0.0 if cube_outer_radius is None else float(cube_outer_radius),
             "center_xy": [float(v) for v in cube_center_xy],
             "rotation": 0.0,
         }
@@ -440,15 +425,27 @@ def generate_dataset(
     # actions through that controller makes the arm interpret XYZ / axis-angle
     # values as six joint targets. Generate with OSC_POSE instead.
     piper_joint_source = str(dataset_meta.get("policy_action_space")).startswith("piper_joint_position")
-    if piper_joint_source:
+    robots = env_meta.get("env_kwargs", {}).get("robots", [])
+    if isinstance(robots, str):
+        robots = [robots]
+    piper_env = any(str(robot).lower() == "piper" for robot in robots)
+    if piper_joint_source or piper_env:
         from robosuite.controllers import load_controller_config
 
         controller_config = load_controller_config(default_controller="OSC_POSE")
         controller_config["control_delta"] = True
+        # MimicGen updates Cartesian waypoints at the policy rate. Interpolate
+        # the OSC setpoint at the simulation rate so the controller does not
+        # see an instantaneous step change at every waypoint.
+        controller_config["interpolation"] = "linear"
         with mg_config.values_unlocked():
             mg_config.experiment.task.env_meta_update_kwargs = {
                 "env_kwargs": {"controller_configs": controller_config}
             }
+            # OSC can lag its commanded pose. Start each subtask bridge from
+            # the measured EEF pose instead of the previous, possibly
+            # unachieved, command.
+            mg_config.experiment.generation.interpolate_from_last_target_pose = False
         print("Using OSC_POSE for MimicGen Cartesian waypoint execution.")
 
     if camera_pose_file is not None:
@@ -468,6 +465,8 @@ def generate_dataset(
             script_lift.DEFAULT_FRONTVIEW_CAMERA_FOVY,
             camera_pose_in_base=camera_pose,
         )
+        if render_image_names is None:
+            render_image_names = [script_lift.DEFAULT_CAMERA_NAME]
         print("Using frontview camera pose from: {}".format(camera_pose_file))
 
     if env_meta.get("env_name") in {"Lift", "LiftPlaceCuboid"}:
@@ -489,27 +488,32 @@ def generate_dataset(
     )
     print("\nData will be generated at: {}".format(new_dataset_folder_path))
 
-    # ensure dataset folder does not exist, and make new folder
+    # A generation run writes every successful episode to tmp before doing the
+    # final merge. On resume, keep those completed episodes and continue until
+    # the configured total number of successes has been reached.
     if os.path.exists(new_dataset_folder_path):
-        raise FileExistsError("Refusing to overwrite dataset folder {}".format(new_dataset_folder_path))
-    os.makedirs(new_dataset_folder_path)
-
-    if output_path is not None:
-        output_path = os.path.abspath(os.path.expandvars(os.path.expanduser(output_path)))
-        output_parent = os.path.dirname(output_path)
-        if len(output_parent) > 0:
-            os.makedirs(output_parent, exist_ok=True)
-        if os.path.exists(output_path):
-            raise FileExistsError("Refusing to overwrite output dataset {}".format(output_path))
+        if not resume:
+            raise FileExistsError("Refusing to overwrite dataset folder {}".format(new_dataset_folder_path))
+        if os.path.exists(os.path.join(new_dataset_folder_path, "demo.hdf5")):
+            raise FileExistsError(
+                "Refusing to resume because the merged dataset already exists: {}".format(
+                    os.path.join(new_dataset_folder_path, "demo.hdf5")
+                )
+            )
+    else:
+        if resume:
+            raise FileNotFoundError("Cannot resume missing dataset folder {}".format(new_dataset_folder_path))
+        os.makedirs(new_dataset_folder_path)
 
     # log terminal output to text file
     RobomimicUtils.make_print_logger(txt_file=os.path.join(new_dataset_folder_path, 'log.txt'))
 
     # save config to disk
-    MG_FileUtils.write_json(
-        json_dic=mg_config,
-        json_path=os.path.join(new_dataset_folder_path, "mg_config.json"),
-    )
+    config_path = os.path.join(new_dataset_folder_path, "mg_config.json")
+    if not resume:
+        MG_FileUtils.write_json(json_dic=mg_config, json_path=config_path)
+    elif not os.path.isfile(config_path):
+        raise FileNotFoundError("Cannot resume without saved config {}".format(config_path))
 
     print("\n============= Config =============")
     print(mg_config)
@@ -518,13 +522,42 @@ def generate_dataset(
     # some paths that we will create inside our new dataset folder
 
     # new dataset that will be generated
-    new_dataset_path = output_path if output_path is not None else os.path.join(new_dataset_folder_path, "demo.hdf5")
-    if output_path is not None:
-        print("Successful trajectories will be written to: {}".format(new_dataset_path))
+    new_dataset_path = os.path.join(new_dataset_folder_path, "demo.hdf5")
 
     # tmp folder that will contain per-episode hdf5s that were successful (they will be merged later)
     tmp_dataset_folder_path = os.path.join(new_dataset_folder_path, "tmp")
     os.makedirs(tmp_dataset_folder_path, exist_ok=True)
+
+    resumed_ep_lengths = []
+    resumed_attempts = 0
+    resumed_failures = 0
+    if resume:
+        tmp_files = list(Path(tmp_dataset_folder_path).glob("*.hdf5"))
+        resumed_successes, resumed_ep_lengths = MG_FileUtils.merge_all_hdf5(
+            folder=tmp_dataset_folder_path,
+            new_hdf5_path=new_dataset_path,
+            dry_run=True,
+            return_horizons=True,
+        )
+        if resumed_successes != len(tmp_files):
+            raise ValueError(
+                "Found {} temporary HDF5 files, but only {} are readable; repair or move the "
+                "invalid files before resuming".format(len(tmp_files), resumed_successes)
+            )
+        # Recover the human-readable counters when possible. The temporary
+        # files remain authoritative for success count and termination.
+        log_text = Path(new_dataset_folder_path, "log.txt").read_text(errors="replace")
+        progress = re.findall(r"have (\d+) successes out of (\d+) trials so far", log_text)
+        if progress:
+            logged_successes, logged_attempts = map(int, progress[-1])
+            if logged_successes <= resumed_successes and logged_attempts >= logged_successes:
+                resumed_attempts = logged_attempts + (resumed_successes - logged_successes)
+                resumed_failures = resumed_attempts - resumed_successes
+        if resumed_attempts == 0:
+            resumed_attempts = resumed_successes
+        print("Resuming with {} completed demonstrations".format(resumed_successes))
+    else:
+        resumed_successes = 0
 
     # folder containing logs
     json_log_path = os.path.join(new_dataset_folder_path, "logs")
@@ -582,10 +615,15 @@ def generate_dataset(
     restore_exp0_lift_generation_behavior(env=env, dataset_meta=dataset_meta)
 
     # get information necessary to create env interface
-    env_interface_name, env_interface_type = MG_FileUtils.get_env_interface_info_from_dataset(
-        dataset_path=source_dataset_path,
-        demo_keys=all_demos,
-    )
+    if (mg_config.experiment.task.interface is not None) and \
+            (mg_config.experiment.task.interface_type is not None):
+        env_interface_name = mg_config.experiment.task.interface
+        env_interface_type = mg_config.experiment.task.interface_type
+    else:
+        env_interface_name, env_interface_type = MG_FileUtils.get_env_interface_info_from_dataset(
+            dataset_path=source_dataset_path,
+            demo_keys=all_demos,
+        )
     # possibly override from config
     if mg_config.experiment.task.interface is not None:
         env_interface_name = mg_config.experiment.task.interface
@@ -619,17 +657,12 @@ def generate_dataset(
     print(data_generator)
     print("")
 
-    # we might write a video to show the data generation attempts
-    video_writer = None
-    if write_video:
-        video_writer = imageio.get_writer(video_path, fps=20)
-
     # data generation statistics
-    num_success = 0
-    num_failures = 0
-    num_attempts = 0
+    num_success = resumed_successes
+    num_failures = resumed_failures
+    num_attempts = resumed_attempts
     num_problematic = 0
-    ep_lengths = [] # episode lengths for successfully generated data
+    ep_lengths = list(resumed_ep_lengths) # episode lengths for successfully generated data
     selected_src_demo_inds_all = [] # selected source demo index in @all_demos for each trial
     selected_src_demo_inds_succ = [] # selected source demo index in @all_demos for each successful trial
 
@@ -637,9 +670,17 @@ def generate_dataset(
     num_trials = mg_config.experiment.generation.num_trials
     guarantee_success = mg_config.experiment.generation.guarantee
 
-    while True:
+    while (num_success if guarantee_success else num_attempts) < num_trials:
 
         # generate trajectory
+        attempt_video_writer = None
+        attempt_video_path = None
+        if write_video:
+            video_root, video_ext = os.path.splitext(video_path)
+            attempt_video_path = "{}_rollout_{:03d}{}".format(
+                video_root, num_attempts + num_problematic + 1, video_ext or ".mp4"
+            )
+            attempt_video_writer = imageio.get_writer(attempt_video_path, fps=20)
         try:
             generated_traj = data_generator.generate(
                 env=env,
@@ -648,7 +689,7 @@ def generate_dataset(
                 transform_first_robot_pose=mg_config.experiment.generation.transform_first_robot_pose,
                 interpolate_from_last_target_pose=mg_config.experiment.generation.interpolate_from_last_target_pose,
                 render=render,
-                video_writer=video_writer,
+                video_writer=attempt_video_writer,
                 video_skip=video_skip,
                 camera_names=render_image_names,
                 video_height=video_height,
@@ -656,6 +697,8 @@ def generate_dataset(
                 pause_subtask=pause_subtask,
             )
         except exceptions_to_except as e:
+            if attempt_video_writer is not None:
+                attempt_video_writer.close()
             # problematic trajectory - do not have this count towards our total number of attempts, and re-try
             print("")
             print("*" * 50)
@@ -664,12 +707,92 @@ def generate_dataset(
             print("")
             num_problematic += 1
             continue
+        if attempt_video_writer is not None:
+            attempt_video_writer.close()
 
         # remember selection of source demos for each subtask
         selected_src_demo_inds_all.append(generated_traj["src_demo_inds"])
 
         # check if generated trajectory was successful
         success = bool(generated_traj["success"])
+
+        reachability = generated_traj.get("reachability", [])
+        first_tracking_failure = next(
+            (entry for entry in reachability if entry["position_error"] > 0.03),
+            None,
+        )
+        first_joint_limit = next(
+            (entry for entry in reachability if entry["near_limit_joints"]),
+            None,
+        )
+        first_collision = next(
+            (entry for entry in reachability if entry["robot_contacts"]),
+            None,
+        )
+        first_saturation = next(
+            (entry for entry in reachability if entry["action_saturated"]),
+            None,
+        )
+        candidates = [
+            entry for entry in (first_tracking_failure, first_saturation)
+            if entry is not None
+        ]
+        first_failure = None if success or not candidates else min(candidates, key=lambda entry: entry["step"])
+        reason = "task_success" if success else "task_success_condition_false"
+        if first_failure is first_tracking_failure:
+            failure_signal = "cartesian_tracking_error_gt_0.03m"
+        elif first_failure is first_saturation:
+            failure_signal = "osc_action_saturation"
+        else:
+            failure_signal = None
+        controller_type = env.base_env.robots[0].controller.__class__.__name__
+        print("[MimicGenDebug] cube_target={} placement_success=True controller={} ik=not_run "
+              "trajectory_reachable={} first_failing_step={} failure_signal={} rejection_reason={}".format(
+            None if generated_traj.get("cube_target") is None else np.round(generated_traj["cube_target"], 6).tolist(),
+            controller_type,
+            success or first_failure is None,
+            None if first_failure is None else first_failure["step"],
+            failure_signal,
+            reason,
+        ))
+        if first_failure is not None:
+            print("[MimicGenDebug] failure_detail subtask={} target={} achieved={} error={:.6f} "
+                  "near_limit_joints={} joint_margin={} contacts={} action_saturated={}".format(
+                first_failure["subtask"],
+                np.round(first_failure["target_pos"], 6).tolist(),
+                np.round(first_failure["achieved_pos"], 6).tolist(),
+                first_failure["position_error"],
+                first_failure["near_limit_joints"],
+                np.round(first_failure["joint_margin"], 6).tolist(),
+                first_failure["robot_contacts"],
+                first_failure["action_saturated"],
+            ))
+
+        if write_diagnostics:
+            diagnostic_path = os.path.join(
+                json_log_path, "rollout_{:03d}_diagnostics.json".format(num_attempts + 1)
+            )
+            diagnostic_payload = {
+                "rollout": num_attempts + 1,
+                "success": success,
+                "cube_target": generated_traj.get("cube_target"),
+                "controller": controller_type,
+                "video_path": attempt_video_path,
+                "failure_timestep": None if first_failure is None else first_failure["step"],
+                "failure_timestep_definition": "first tracking error > 0.03 m or saturated OSC action",
+                "first_tracking_error_gt_0.03m": None if first_tracking_failure is None else first_tracking_failure["step"],
+                "first_action_saturation": None if first_saturation is None else first_saturation["step"],
+                "first_joint_limit_margin_le_0.1rad": None if first_joint_limit is None else first_joint_limit["step"],
+                "first_robot_contact": None if first_collision is None else first_collision["step"],
+                "trajectory": reachability,
+            }
+            with open(diagnostic_path, "w") as diagnostic_file:
+                json.dump(
+                    diagnostic_payload,
+                    diagnostic_file,
+                    indent=2,
+                    default=lambda value: value.tolist() if isinstance(value, np.ndarray) else value,
+                )
 
         if success:
             num_success += 1
@@ -739,14 +862,6 @@ def generate_dataset(
                 np.round((100. * num_success) / num_attempts, 2),
             ))
             MG_FileUtils.write_json(json_dic=summary_stats, json_path=json_file_path)
-
-        # termination condition is on enough successes if @guarantee_success or enough attempts otherwise
-        check_val = num_success if guarantee_success else num_attempts
-        if check_val >= num_trials:
-            break
-
-    if write_video:
-        video_writer.close()
 
     # merge all new created files
     print("\nFinished data generation. Merging per-episode hdf5s together...\n")
@@ -866,9 +981,8 @@ def main(args):
             print("deleting subtask {} in original config".format(subtask))
             del mg_config.task.task_spec[subtask]
 
-        # maybe override some settings
-        if args.task_name is not None:
-            mg_config.experiment.task.name = args.task_name
+        if args.folder is not None:
+            mg_config.experiment.generation.path = args.folder
 
         if args.source is not None:
             mg_config.experiment.source.dataset_path = args.source
@@ -876,19 +990,16 @@ def main(args):
         if args.source_filter_key is not None:
             mg_config.experiment.source.filter_key = args.source_filter_key
 
-        if args.source_n is not None:
-            mg_config.experiment.source.n = args.source_n
+        if args.discard_failed:
+            mg_config.experiment.generation.keep_failed = False
 
-        if args.source_start is not None:
-            mg_config.experiment.source.start = args.source_start
-
-        if args.folder is not None:
-            mg_config.experiment.generation.path = args.folder
+        if args.seed is not None:
+            mg_config.experiment.seed = args.seed
 
         if args.num_demos is not None:
+            if args.num_demos <= 0:
+                raise ValueError("--num_demos must be positive")
             mg_config.experiment.generation.num_trials = args.num_demos
-            # The CLI name says "num_demos", so treat it as the requested
-            # number of successful trajectories rather than total attempts.
             mg_config.experiment.generation.guarantee = True
 
         # maybe modify config for debugging purposes
@@ -909,16 +1020,12 @@ def main(args):
             mg_config=mg_config,
             render=args.render,
             video_path=args.video_path,
-            video_skip=args.video_skip,
-            render_image_names=args.render_image_names,
-            video_height=args.video_height,
-            video_width=args.video_width,
             pause_subtask=args.pause_subtask,
-            output_path=args.output,
             camera_pose_file=args.camera_pose_file,
             cube_center_xy=args.cube_center_xy,
-            cube_inner_radius=args.cube_inner_radius,
             cube_outer_radius=args.cube_outer_radius,
+            write_diagnostics=not args.no_diagnostics,
+            resume=args.resume,
         )
     except Exception as e:
         res_str = "run failed with error:\n{}\n\n{}".format(e, traceback.format_exc())
@@ -954,73 +1061,22 @@ if __name__ == "__main__":
         help="if provided, render the data generation attempts to the provided video path",
     )
     parser.add_argument(
-        "--video_skip",
-        type=int,
-        default=5,
-        help="skip every nth frame when writing video",
-    )
-    parser.add_argument("--video_height", type=int, default=480)
-    parser.add_argument("--video_width", type=int, default=640)
-    parser.add_argument(
         "--cube_center_xy",
         type=float,
         nargs=2,
         default=None,
-        help="center XY for generated cuboid positions; defaults to the source center",
-    )
-    parser.add_argument(
-        "--cube_inner_radius",
-        type=float,
-        default=None,
-        help="inner radius of generated cuboid positions (default: 0)",
+        help="cuboid sampling center XY (fixed unless --cube_outer_radius is also set)",
     )
     parser.add_argument(
         "--cube_outer_radius",
         type=float,
         default=None,
-        help="enable random generated cuboid positions within this outer radius",
-    )
-    parser.add_argument(
-        "--render_image_names",
-        type=str,
-        nargs='+',
-        default=None,
-        help="(optional) camera name(s) / image observation(s) to use for rendering on-screen or to video. Default is"
-             "None, which corresponds to a predefined camera for each env type",
+        help="sample cuboid positions area-uniformly within this radius around --cube_center_xy",
     )
     parser.add_argument(
         "--pause_subtask",
         action='store_true',
         help="pause after every subtask during generation for debugging - only useful with render flag",
-    )
-    parser.add_argument(
-        "--source",
-        type=str,
-        help="path to source dataset, to override the one in the config",
-    )
-    parser.add_argument(
-        "--source_filter_key",
-        type=str,
-        help="optional source dataset mask key, for example 'successful'",
-        default=None,
-    )
-    parser.add_argument(
-        "--source_n",
-        type=int,
-        help="if provided, use only the first N source trajectories after filtering / start offset",
-        default=None,
-    )
-    parser.add_argument(
-        "--source_start",
-        type=int,
-        help="if provided, skip the first N source trajectories after filtering",
-        default=None,
-    )
-    parser.add_argument(
-        "--task_name",
-        type=str,
-        help="environment name to use for data generation, to override the one in the config",
-        default=None,
     )
     parser.add_argument(
         "--folder",
@@ -1029,22 +1085,44 @@ if __name__ == "__main__":
         default=None,
     )
     parser.add_argument(
-        "--output",
+        "--source",
         type=str,
-        help="optional exact path for the generated successful demo hdf5; logs still go under --folder / experiment name",
         default=None,
+        help="source HDF5 path, overriding the config",
+    )
+    parser.add_argument(
+        "--source_filter_key",
+        type=str,
+        default=None,
+        help="source dataset mask containing valid demonstrations",
+    )
+    parser.add_argument(
+        "--num_demos",
+        type=int,
+        default=None,
+        help="number of successful demos to generate (failed attempts are retried)",
+    )
+    parser.add_argument("--seed", type=int, default=None, help="generation random seed")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="continue an interrupted run from readable per-episode HDF5 files in its tmp folder",
+    )
+    parser.add_argument(
+        "--discard_failed",
+        action="store_true",
+        help="do not save failed trajectories",
+    )
+    parser.add_argument(
+        "--no_diagnostics",
+        action="store_true",
+        help="do not write one large diagnostics JSON per rollout",
     )
     parser.add_argument(
         "--camera-pose-file",
         type=str,
         default=None,
         help="camera pose in the robot base frame, for example ../data/cam_in_base.txt",
-    )
-    parser.add_argument(
-        "--num_demos",
-        type=int,
-        help="number of successful demos to generate; generation keeps retrying after failed attempts",
-        default=None,
     )
     args = parser.parse_args()
     main(args)

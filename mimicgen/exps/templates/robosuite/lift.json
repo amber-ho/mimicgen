@@ -4,7 +4,7 @@
     "experiment": {
         "name": "lift",
         "source": {
-            "dataset_path": "lift/D_s_mimicgen.hdf5",
+            "dataset_path": "outputs/LiftPlaceCuboid/3000_2/D_s.hdf5",
             "filter_key": null,
             "n": null,
             "start": null
@@ -16,10 +16,10 @@
             "num_trials": 10,
             "select_src_per_subtask": false,
             "transform_first_robot_pose": false,
-            "interpolate_from_last_target_pose": true
+            "interpolate_from_last_target_pose": false
         },
         "task": {
-            "name": "Lift",
+            "name": "LiftPlaceCuboid",
             "robot": "Piper",
             "gripper": null,
             "env_meta_update_kwargs": {},
@@ -27,7 +27,7 @@
             "interface_type": "robosuite"
         },
         "max_num_failures": 50,
-        "render_video": true,
+        "render_video": false,
         "num_demo_to_render": 50,
         "num_fail_demo_to_render": 50,
         "log_every_n_attempts": 50,
