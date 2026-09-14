@@ -410,8 +410,7 @@ class WaypointTrajectory(object):
                 # step environment
                 env.step(play_action)
 
-                # Piper generation uses OSC_POSE, not an inverse-kinematics
-                # controller. Record achieved Cartesian tracking, joint-limit
+                # Record achieved Cartesian tracking, joint-limit
                 # margin, and contacts without changing rollout behavior.
                 achieved_pose = env_interface.get_robot_eef_pose()
                 position_error = float(np.linalg.norm(waypoint.pose[:3, 3] - achieved_pose[:3, 3]))

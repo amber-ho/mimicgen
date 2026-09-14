@@ -61,6 +61,11 @@ class RobosuiteInterface(MG_EnvInterface):
         # target position and rotation
         target_pos, target_rot = PoseUtils.unmake_pose(target_pose)
 
+        if self.env.robots[0].robot_model.__class__.__name__ == "Piper" and self.env.robots[0].controller.name == "JOINT_POSITION":
+            from piper_action_space import joint_action_from_target_pose
+
+            return joint_action_from_target_pose(self.env, target_pos, target_rot)
+
         # current position and rotation
         curr_pose = self.get_robot_eef_pose()
         curr_pos, curr_rot = PoseUtils.unmake_pose(curr_pose)
@@ -103,6 +108,22 @@ class RobosuiteInterface(MG_EnvInterface):
         # version check for robosuite - must be v1.2+, so that we're using the correct controller convention
         assert (robosuite.__version__.split(".")[0] == "1")
         assert (robosuite.__version__.split(".")[1] >= "2")
+
+        if self.env.robots[0].robot_model.__class__.__name__ == "Piper" and self.env.robots[0].controller.name == "JOINT_POSITION":
+            # Source actions are normalized joint deltas. Recover their target
+            # EEF pose by FK without advancing or teleporting the rollout.
+            robot = self.env.robots[0]
+            sim = self.env.sim
+            ids = robot._ref_joint_pos_indexes
+            initial = sim.data.qpos[ids].copy()
+            try:
+                sim.data.qpos[ids] = initial + np.asarray(action[:6]) * robot.controller.output_max
+                sim.forward()
+                site = robot.controller.eef_name
+                return PoseUtils.make_pose(sim.data.get_site_xpos(site).copy(), sim.data.get_site_xmat(site).copy())
+            finally:
+                sim.data.qpos[ids] = initial
+                sim.forward()
 
         if (not relative):
             # convert absolute action to absolute pose
@@ -229,9 +250,13 @@ class MG_Lift(RobosuiteInterface):
             object_geoms=self.env.cube,
         ))
 
-        # For LiftPlaceCuboid, split after the cube has actually cleared the
-        # table. This is robust for state-playback source datasets where the
-        # contact-based grasp signal can remain zero for the whole trajectory.
+        # Keep the legacy "lift" subtask key, but permit transfers that never
+        # reach a fixed lift height. State playback can lack grasp contacts;
+        # reaching the target provides a fallback boundary for those sources.
+        if hasattr(self.env, "_cube_on_target"):
+            signals["lift"] = int(signals["grasp"] or self.env._cube_on_target())
+            return signals
+
         cube_pos = np.asarray(self.env.sim.data.body_xpos[self.env.cube_body_id])
         target_pose = self.get_object_poses().get("target_line")
         table_height = (

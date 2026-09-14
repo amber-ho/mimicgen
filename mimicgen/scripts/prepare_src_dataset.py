@@ -28,6 +28,7 @@ from tqdm import tqdm
 
 SIM_ROOT = Path(__file__).resolve().parents[3]
 LOCAL_PACKAGE_ROOTS = (
+    SIM_ROOT / "scripts",
     SIM_ROOT / "mimicgen" / "robomimic",
     SIM_ROOT / "mimicgen",
     SIM_ROOT / "robosuite",
@@ -162,7 +163,11 @@ def prepare_src_dataset(
     # create environment that was to collect source demonstrations
     env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=dataset_path)
     policy_action_space = env_meta.get("policy_action_space")
-    target_pose_from_next_eef = str(policy_action_space).startswith("piper_joint_position")
+    controller_type = env_meta.get("env_kwargs", {}).get("controller_configs", {}).get("type")
+    target_pose_from_next_eef = (
+        str(policy_action_space).startswith("piper_joint_position")
+        and controller_type != "JOINT_POSITION"
+    )
     if target_pose_from_next_eef:
         print(
             "Detected Piper joint-position source actions; deriving Cartesian "
@@ -250,7 +255,7 @@ def prepare_src_dataset(
         successful_demos = []
         for ep in demos:
             rewards = f["data/{}/rewards".format(ep)][()]
-            if len(rewards) > 0 and rewards[-1] > 0:
+            if len(rewards) > 0 and np.any(rewards > 0):
                 successful_demos.append(ep)
 
         mask_grp = f.require_group("mask")
@@ -303,7 +308,7 @@ if __name__ == "__main__":
         "--success_filter_key",
         type=str,
         default=None,
-        help="(optional) write a mask with demos whose final reward is positive, e.g. successful",
+        help="(optional) write a mask with demos that reached a positive task reward",
     )
 
     args = parser.parse_args()

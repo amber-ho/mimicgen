@@ -40,6 +40,7 @@ from xml.etree import ElementTree as ET
 
 SIM_ROOT = Path(__file__).resolve().parents[3]
 LOCAL_PACKAGE_ROOTS = (
+    SIM_ROOT / "scripts",
     SIM_ROOT / "mimicgen" / "robomimic",
     SIM_ROOT / "mimicgen",
     SIM_ROOT / "robosuite",
@@ -420,33 +421,26 @@ def generate_dataset(
         }
         print("Overriding generated cube placement: {}".format(dataset_meta["cube_placement"]))
 
-    # MimicGen executes Cartesian EEF waypoints. Source demonstrations may have
-    # been recorded with Piper joint-position actions, but replaying Cartesian
-    # actions through that controller makes the arm interpret XYZ / axis-angle
-    # values as six joint targets. Generate with OSC_POSE instead.
+    # The Piper interface converts Cartesian waypoints through IK, then executes
+    # the same joint-position controller and absolute gripper widths as evaluation.
     piper_joint_source = str(dataset_meta.get("policy_action_space")).startswith("piper_joint_position")
     robots = env_meta.get("env_kwargs", {}).get("robots", [])
     if isinstance(robots, str):
         robots = [robots]
     piper_env = any(str(robot).lower() == "piper" for robot in robots)
     if piper_joint_source or piper_env:
-        from robosuite.controllers import load_controller_config
+        from piper_action_space import piper_controller_config
 
-        controller_config = load_controller_config(default_controller="OSC_POSE")
-        controller_config["control_delta"] = True
-        # MimicGen updates Cartesian waypoints at the policy rate. Interpolate
-        # the OSC setpoint at the simulation rate so the controller does not
-        # see an instantaneous step change at every waypoint.
-        controller_config["interpolation"] = "linear"
+        controller_config = piper_controller_config()
         with mg_config.values_unlocked():
             mg_config.experiment.task.env_meta_update_kwargs = {
                 "env_kwargs": {"controller_configs": controller_config}
             }
-            # OSC can lag its commanded pose. Start each subtask bridge from
+            # Start each subtask bridge from
             # the measured EEF pose instead of the previous, possibly
             # unachieved, command.
             mg_config.experiment.generation.interpolate_from_last_target_pose = False
-        print("Using OSC_POSE for MimicGen Cartesian waypoint execution.")
+        print("Using Piper JOINT_POSITION with IK for Cartesian waypoints.")
 
     if camera_pose_file is not None:
         camera_pose_file = os.path.abspath(os.path.expanduser(camera_pose_file))
@@ -612,6 +606,10 @@ def generate_dataset(
     print("\n==== Using environment with the following metadata ====")
     print(json.dumps(env.serialize(), indent=4))
     print("")
+    if piper_env:
+        from script_lift import piper_real_rest_qpos
+
+        env.base_env.robots[0].init_qpos = piper_real_rest_qpos()
     restore_exp0_lift_generation_behavior(env=env, dataset_meta=dataset_meta)
 
     # get information necessary to create env interface
@@ -742,11 +740,11 @@ def generate_dataset(
         if first_failure is first_tracking_failure:
             failure_signal = "cartesian_tracking_error_gt_0.03m"
         elif first_failure is first_saturation:
-            failure_signal = "osc_action_saturation"
+            failure_signal = "controller_action_saturation"
         else:
             failure_signal = None
         controller_type = env.base_env.robots[0].controller.__class__.__name__
-        print("[MimicGenDebug] cube_target={} placement_success=True controller={} ik=not_run "
+        print("[MimicGenDebug] cube_target={} placement_success=True controller={} "
               "trajectory_reachable={} first_failing_step={} failure_signal={} rejection_reason={}".format(
             None if generated_traj.get("cube_target") is None else np.round(generated_traj["cube_target"], 6).tolist(),
             controller_type,
