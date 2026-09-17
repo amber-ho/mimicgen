@@ -48,6 +48,38 @@ class Lift_Config(MG_Config):
         self.task.task_spec.do_not_lock_keys()
 
 
+class PegInsertion_Config(MG_Config):
+    """Object-relative generation config for Piper peg insertion."""
+
+    NAME = "peg_insertion"
+    TYPE = "robosuite"
+
+    def task_config(self):
+        self.task.task_spec.subtask_1 = dict(
+            object_ref="receptacle",
+            subtask_term_signal="grasp",
+            subtask_term_offset_range=(5, 12),
+            selection_strategy="nearest_neighbor_object",
+            selection_strategy_kwargs=dict(nn_k=3),
+            action_noise=0.02,
+            num_interpolation_steps=8,
+            num_fixed_steps=2,
+            apply_noise_during_interpolation=False,
+        )
+        self.task.task_spec.subtask_2 = dict(
+            object_ref="peg",
+            subtask_term_signal=None,
+            subtask_term_offset_range=None,
+            selection_strategy="nearest_neighbor_object",
+            selection_strategy_kwargs=dict(nn_k=3),
+            action_noise=0.01,
+            num_interpolation_steps=10,
+            num_fixed_steps=4,
+            apply_noise_during_interpolation=False,
+        )
+        self.task.task_spec.do_not_lock_keys()
+
+
 class Coffee_Config(MG_Config):
     """
     Corresponds to robosuite Coffee task and variants.

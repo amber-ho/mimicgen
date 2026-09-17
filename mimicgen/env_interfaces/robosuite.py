@@ -272,6 +272,27 @@ class MG_Lift(RobosuiteInterface):
         return signals
 
 
+class MG_PegInsertion(RobosuiteInterface):
+    """MimicGen interface for the handled receptacle and fixed peg."""
+
+    def get_object_poses(self):
+        return dict(
+            receptacle=self.get_object_pose(
+                obj_name=self.env.receptacle.root_body, obj_type="body"),
+            peg=self.get_object_pose(obj_name=self.env.peg.root_body, obj_type="body"),
+        )
+
+    def get_subtask_term_signals(self):
+        # Lift is a stable boundary in replayed states even when MuJoCo's
+        # bilateral fingertip heuristic briefly drops a contact.
+        hole_z = float(self.env._hole_pos()[2])
+        table_z = float(self.env.sim.data.get_site_xpos("table_top")[2])
+        return dict(
+            grasp=int(hole_z > table_z + 0.035),
+            insert=int(self.env._check_success()),
+        )
+
+
 class MG_Coffee(RobosuiteInterface):
     """
     Corresponds to robosuite Coffee task and variants.
