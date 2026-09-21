@@ -67,6 +67,9 @@ from mimicgen.datagen.data_generator import DataGenerator
 from mimicgen.env_interfaces.base import make_interface
 
 
+PEG_RECEPTACLE_CENTER_XY = (-0.13, -0.03)
+
+
 class AnnulusRandomSampler(ObjectPositionSampler):
     """
     Area-uniform annulus sampler used by the exp0 Lift source / target datasets.
@@ -308,6 +311,67 @@ def restore_exp0_lift_generation_behavior(env, dataset_meta):
     print("Restored exp0 Piper reset prealignment with yaw limit {}".format(yaw_limit))
 
 
+def configure_peg_receptacle_sampling(env_meta, dataset_meta, outer_radius):
+    """Configure area-uniform receptacle XY sampling without moving the peg."""
+    if outer_radius is None:
+        return
+    if outer_radius < 0.0:
+        raise ValueError("receptacle outer radius must be non-negative")
+    if env_meta.get("env_name") != "PegInsertion":
+        raise ValueError("--receptacle_outer_radius requires a PegInsertion source dataset")
+
+    env_kwargs = env_meta.setdefault("env_kwargs", {})
+    source_pose = env_kwargs.get("receptacle_pose")
+    if source_pose is None or len(source_pose) != 3:
+        raise ValueError("PegInsertion source metadata must contain receptacle_pose (x, y, yaw)")
+
+    # PegInsertion only consults placement_initializer when receptacle_pose is
+    # None. Keep the source yaw fixed and randomize XY in the sampler below.
+    env_kwargs["receptacle_pose"] = None
+    dataset_meta["peg_insertion_placement"] = {
+        "type": "area_uniform_annulus",
+        "inner_radius": 0.0,
+        "outer_radius": float(outer_radius),
+        "center_xy": list(PEG_RECEPTACLE_CENTER_XY),
+        "rotation": float(source_pose[2]),
+    }
+    print(
+        "Overriding generated receptacle placement: {}".format(
+            dataset_meta["peg_insertion_placement"]
+        )
+    )
+
+
+def restore_peg_receptacle_generation_behavior(env, dataset_meta):
+    """Install the non-serializable annulus sampler requested in metadata."""
+    placement_meta = dataset_meta.get("peg_insertion_placement")
+    base_env = env.base_env
+    if (
+        not isinstance(placement_meta, dict)
+        or placement_meta.get("type") != "area_uniform_annulus"
+        or not hasattr(base_env, "receptacle")
+    ):
+        return
+
+    table_height = float(base_env.model.mujoco_arena.table_offset[2])
+    base_env.receptacle_pose = None
+    base_env.placement_initializer = AnnulusRandomSampler(
+        name="ReceptacleSampler",
+        mujoco_objects=base_env.receptacle,
+        inner_radius=float(placement_meta["inner_radius"]),
+        outer_radius=float(placement_meta["outer_radius"]),
+        center_xy=placement_meta["center_xy"],
+        rotation=float(placement_meta["rotation"]),
+        ensure_valid_placement=False,
+        reference_pos=(0.0, 0.0, table_height),
+        # ObjectPositionSampler subtracts bottom_offset, so zero places the
+        # receptacle center exactly one half-height above the table, matching
+        # the fixed source pose. Only XY is randomized.
+        z_offset=0.0,
+    )
+    print("Restored annulus receptacle placement: {}".format(placement_meta))
+
+
 def get_important_stats(
     new_dataset_folder_path,
     num_success,
@@ -362,6 +426,7 @@ def generate_dataset(
     camera_pose_file=None,
     cube_center_xy=None,
     cube_outer_radius=None,
+    receptacle_outer_radius=None,
     write_diagnostics=True,
     resume=False,
 ):
@@ -405,6 +470,12 @@ def generate_dataset(
     # get environment metadata from dataset
     env_meta = get_env_metadata_from_dataset(dataset_path=source_dataset_path)
     dataset_meta = get_exp0_dataset_meta(source_dataset_path)
+
+    configure_peg_receptacle_sampling(
+        env_meta=env_meta,
+        dataset_meta=dataset_meta,
+        outer_radius=receptacle_outer_radius,
+    )
 
     if cube_outer_radius is not None and cube_outer_radius < 0.0:
         raise ValueError("cube outer radius must be non-negative")
@@ -611,6 +682,7 @@ def generate_dataset(
 
         env.base_env.robots[0].init_qpos = piper_real_rest_qpos()
     restore_exp0_lift_generation_behavior(env=env, dataset_meta=dataset_meta)
+    restore_peg_receptacle_generation_behavior(env=env, dataset_meta=dataset_meta)
 
     # get information necessary to create env interface
     if (mg_config.experiment.task.interface is not None) and \
@@ -1022,6 +1094,7 @@ def main(args):
             camera_pose_file=args.camera_pose_file,
             cube_center_xy=args.cube_center_xy,
             cube_outer_radius=args.cube_outer_radius,
+            receptacle_outer_radius=getattr(args, "receptacle_outer_radius", None),
             write_diagnostics=not args.no_diagnostics,
             resume=args.resume,
         )
@@ -1070,6 +1143,14 @@ if __name__ == "__main__":
         type=float,
         default=None,
         help="sample cuboid positions area-uniformly within this radius around --cube_center_xy",
+    )
+    parser.add_argument(
+        "--receptacle_outer_radius",
+        "--receptacle-outer-radius",
+        type=float,
+        default=None,
+        help=("sample PegInsertion receptacle XY positions area-uniformly within this "
+              "radius around (-0.13, -0.03); yaw and peg position stay fixed"),
     )
     parser.add_argument(
         "--pause_subtask",
